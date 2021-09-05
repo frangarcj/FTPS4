@@ -2,7 +2,21 @@
  * Copyright (c) 2015 Sergi Granell (xerpi)
  */
 
-#include "ps4.h"
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <fcntl.h>
+
+#include <orbis/libkernel.h>
+#include <orbis/libSceNet.h>
+
 
 extern int netdbg_sock;
 
@@ -153,7 +167,7 @@ static void cmd_PASV_func(ClientInfo *client)
 	/* Fill the data socket address */
 	client->data_sockaddr.sin_len = sizeof(client->data_sockaddr);
 	client->data_sockaddr.sin_family = AF_INET;
-	client->data_sockaddr.sin_addr.s_addr = sceNetHtonl(IN_ADDR_ANY);
+	client->data_sockaddr.sin_addr.s_addr = sceNetHtonl(INADDR_ANY);
 	/* Let the PS4 choose a port */
 	client->data_sockaddr.sin_port = sceNetHtons(0);
 
@@ -328,7 +342,7 @@ static void send_LIST(ClientInfo *client, const char *path)
 
 		while (dent->d_fileno) {
 			if (stat(dent->d_name, &st) == 0) {
-				gmtime_r(&st.st_ctim.tv_sec, &tm);
+				gmtime_s(&tm, &st.st_ctim.tv_sec);
 
 				gen_list_format(buffer, sizeof(buffer),
 					st.st_mode,
@@ -831,7 +845,7 @@ static void *server_thread(void *arg)
 	/* Fill the server's address */
 	serveraddr.sin_len = sizeof(serveraddr);
 	serveraddr.sin_family = AF_INET;
-	serveraddr.sin_addr.s_addr = sceNetHtonl(IN_ADDR_ANY);
+	serveraddr.sin_addr.s_addr = sceNetHtonl(INADDR_ANY);
 	serveraddr.sin_port = sceNetHtons(ps4_port);
 
 	/* Bind the server's address to the socket */

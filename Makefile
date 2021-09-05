@@ -1,39 +1,22 @@
-TEXT	:=	0x926200000
-DATA	:=	0x926300000
+ifndef ORBISDEV
+$(error ORBISDEV, is not set)
+endif
 
-CC		:=	gcc
-AS		:=	gcc
-OBJCOPY	:=	objcopy
-ODIR	:=	build
-SDIR	:=	source
-IDIRS	:=	-I$(PS4SDK)/include -I. -Iinclude
-LDIRS	:=	-L$(PS4SDK) -L. -Llib
-CFLAGS	:=	$(IDIRS) -O2 -fno-builtin -nostartfiles -nostdlib -Wall -masm=intel -march=btver2 -mtune=btver2 -m64 -mabi=sysv -mcmodel=large -DTEXT_ADDRESS=$(TEXT) -DDATA_ADDRESS=$(DATA)
-SFLAGS	:=	-nostartfiles -nostdlib -march=btver2 -mtune=btver2
-LFLAGS	:=	$(LDIRS) -Ttext=$(TEXT) -Tdata=$(DATA)
-CFILES	:=	$(wildcard $(SDIR)/*.c)
-SFILES	:=	$(wildcard $(SDIR)/*.s)
-OBJS	:=	$(patsubst $(SDIR)/%.c, build/%.o, $(CFILES)) $(patsubst $(SDIR)/%.s, build/%.o, $(SFILES))
+target ?= ps4_elf_sce
+TargetFile=homebrew.elf
 
-LIBS	:=	-lPS4-SDK
+include $(ORBISDEV)/make/ps4sdk.mk
+LinkerFlags+=  -lkernel_stub  -lSceLibcInternal_stub  -lSceSysmodule_stub -lSceSystemService_stub -lSceNet_stub -lSceUserService_stub -lScePigletv2VSH_stub -lSceVideoOut_stub -lSceGnmDriver_stub -lorbisGl2 -lorbis -lScePad_stub -lSceAudioOut_stub -lSceIme_stub  
+CompilerFlags +=-D__PS4__ -D__ORBIS__
+IncludePath += -I$(ORBISDEV)/usr/include -I$(ORBISDEV)/usr/include/c++/v1 -I$(ORBISDEV)/usr/include/orbis
+AUTH_INFO = 000000000000000000000000001C004000FF000000000080000000000000000000000000000000000000008000400040000000000000008000000000000000080040FFFF000000F000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
 
-TARGET = $(shell basename $(CURDIR))
-
-$(TARGET): $(ODIR) $(OBJS)
-	$(CC) $(PS4SDK)/crt0.s $(ODIR)/*.o -o temp.t $(CFLAGS) $(LFLAGS) $(LIBS)
-	$(OBJCOPY) -O binary temp.t $(TARGET)
-	rm -f temp.t
-
-$(ODIR)/%.o: $(SDIR)/%.c
-	$(CC) -c -o $@ $< $(CFLAGS)
-
-$(ODIR)/%.o: $(SDIR)/%.s
-	$(AS) -c -o $@ $< $(SFLAGS)
-
-$(ODIR):
-	@mkdir $@
-
-.PHONY: clean
-
-clean:
-	rm -f $(TARGET) $(ODIR)/*.o
+install:
+	@cp $(OutPath)/homebrew.self /usr/local/orbisdev/git/ps4sh/bin/hostapp
+	@echo "Installed!"
+oelf:
+	orbis-elf-create bin/homebrew.elf bin/homebrew.oelf
+eboot:
+	python $(ORBISDEV)/bin/make_fself.py --auth-info $(AUTH_INFO) bin/homebrew.oelf bin/homebrew.self
+pkg_build:
+	cp bin/homebrew.self pkg/eboot.bin && cd pkg && pkgTool pkg_build Project.gp4 . && cp *.pkg ../bin/
