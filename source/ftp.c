@@ -17,24 +17,14 @@
 #include <orbis/libkernel.h>
 #include <orbis/libSceNet.h>
 
-
-extern int netdbg_sock;
+#include <debugnet.h>
+#include "ftp.h"
+#include "netctl.h"
 
 #define UNUSED(x) (void)(x)
 
-
-#define debug(...) \
-	do { \
-		char debug_buffer[512]; \
-		int size = sprintf(debug_buffer, ##__VA_ARGS__); \
-		sceNetSend(netdbg_sock, debug_buffer, size, 0); \
-	} while(0)
-
-
-#define DEBUG(...) debug(__VA_ARGS__)
-#define INFO(...) debug(__VA_ARGS__)
-
-#define PATH_MAX 255
+#define PATH_MAX 256
+#define TemporaryNameSize 4096
 
 #define NET_INIT_SIZE 1*1024*1024
 #define FILE_BUF_SIZE 4*1024*1024
@@ -82,15 +72,17 @@ typedef struct {
 	cmd_dispatch_func func;
 } cmd_dispatch_entry;
 
-static void *net_memory = NULL;
-static int ftp_initialized = 0;
-static struct in_addr ps4_addr;
-static unsigned short int ps4_port;
-static ScePthread server_thid;
-static int server_sockfd;
-static int number_clients = 0;
-static ClientInfo *client_list = NULL;
-static ScePthreadMutex client_list_mtx;
+void *net_memory = NULL;
+int ftp_initialized = 0;
+int ftp_active=1;
+struct in_addr ps4_addr;
+unsigned short int ps4_port;
+ScePthread server_thid;
+int server_sockfd;
+int number_clients = 0;
+ClientInfo *client_list = NULL;
+ScePthreadMutex client_list_mtx;
+
 
 #define client_send_ctrl_msg(cl, str) \
 	sceNetSend(cl->ctrl_sockfd, str, strlen(str), 0)
@@ -135,6 +127,8 @@ static void cmd_PASS_func(ClientInfo *client)
 static void cmd_QUIT_func(ClientInfo *client)
 {
 	client_send_ctrl_msg(client, "221 Goodbye senpai :'(\n");
+	ftp_active=0;
+	
 }
 
 static void cmd_SYST_func(ClientInfo *client)
@@ -153,8 +147,7 @@ static void cmd_PASV_func(ClientInfo *client)
 
 	/* Create data mode socket name */
 	char data_socket_name[64];
-	sprintf(data_socket_name, "FTPS4_client_%i_data_socket",
-		client->num);
+	sprintf(data_socket_name, "FTPS4_client_%i_data_socket",client->num);
 
 	/* Create the data socket */
 	client->data_sockfd = sceNetSocket(data_socket_name,
@@ -162,7 +155,7 @@ static void cmd_PASV_func(ClientInfo *client)
 		SOCK_STREAM,
 		0);
 
-	DEBUG("PASV data socket fd: %d\n", client->data_sockfd);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] PASV data socket fd: %d\n", client->data_sockfd);
 
 	/* Fill the data socket address */
 	client->data_sockaddr.sin_len = sizeof(client->data_sockaddr);
@@ -175,18 +168,18 @@ static void cmd_PASV_func(ClientInfo *client)
 	ret = sceNetBind(client->data_sockfd,
 		(struct sockaddr *)&client->data_sockaddr,
 		sizeof(client->data_sockaddr));
-	DEBUG("sceNetBind(): 0x%08X\n", ret);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] sceNetBind(): 0x%08X\n", ret);
 
 	/* Start listening */
 	ret = sceNetListen(client->data_sockfd, 128);
-	DEBUG("sceNetListen(): 0x%08X\n", ret);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] sceNetListen(): 0x%08X\n", ret);
 
 	/* Get the port that the PS4 has chosen */
 	namelen = sizeof(picked);
 	sceNetGetsockname(client->data_sockfd, (struct sockaddr *)&picked,
 		&namelen);
 
-	DEBUG("PASV mode port: 0x%04X\n", picked.sin_port);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] PASV mode port: 0x%04X\n", picked.sin_port);
 
 	/* Build the command */
 	sprintf(cmd, "227 Entering Passive Mode (%hhu,%hhu,%hhu,%hhu,%hhu,%hhu)\n",
@@ -224,7 +217,7 @@ static void cmd_PORT_func(ClientInfo *client)
 	/* Convert the IP to a struct in_addr */
 	sceNetInetPton(AF_INET, ip_str, &data_addr);
 
-	DEBUG("PORT connection to client's IP: %s Port: %d\n", ip_str, data_port);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] PORT connection to client's IP: %s Port: %d\n", ip_str, data_port);
 
 	/* Create data mode socket name */
 	char data_socket_name[64];
@@ -237,7 +230,7 @@ static void cmd_PORT_func(ClientInfo *client)
 		SOCK_STREAM,
 		0);
 
-	DEBUG("Client %i data socket fd: %d\n", client->num,
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Client %i data socket fd: %d\n", client->num,
 		client->data_sockfd);
 
 	/* Prepare socket address for the data connection */
@@ -265,14 +258,14 @@ static void client_open_data_connection(ClientInfo *client)
 			(struct sockaddr *)&client->data_sockaddr,
 			sizeof(client->data_sockaddr));
 
-		DEBUG("sceNetConnect(): 0x%08X\n", ret);
+		debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] sceNetConnect(): 0x%08X\n", ret);
 	} else {
 		/* Listen to the client using the data socket */
 		addrlen = sizeof(client->pasv_sockaddr);
 		client->pasv_sockfd = sceNetAccept(client->data_sockfd,
 			(struct sockaddr *)&client->pasv_sockaddr,
 			&addrlen);
-		DEBUG("PASV client fd: 0x%08X\n", client->pasv_sockfd);
+		debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] PASV client fd: 0x%08X\n", client->pasv_sockfd);
 	}
 }
 
@@ -324,7 +317,18 @@ static void send_LIST(ClientInfo *client, const char *path)
 	int dfd;
 	struct dirent *dent;
 	struct stat st;
-	struct tm tm;
+	struct tm * tm;
+
+	int i;
+	char *temporaryName;
+			debugNetPrintf(DEBUGNET_DEBUG,"weeeeeeeeee\n");
+
+	temporaryName = malloc(TemporaryNameSize);
+	if(temporaryName == NULL)
+	{
+		debugNetPrintf(DEBUGNET_DEBUG,"error calling malloc\n");
+		return;
+	}
 
 	dfd = open(path, O_RDONLY, 0);
 	if (dfd < 0) {
@@ -339,31 +343,53 @@ static void send_LIST(ClientInfo *client, const char *path)
 
 	while (getdents(dfd, dentbuf, sizeof(dentbuf)) != 0) {
 		dent = (struct dirent *)dentbuf;
-
-		while (dent->d_fileno) {
-			if (stat(dent->d_name, &st) == 0) {
+		while(dent->d_fileno ) {
+			
+			strcpy(temporaryName, path);
+			size_t l = strlen(path);
+			if(l > 0 && path[l - 1] != '/')
+			{
+				strcat(temporaryName, "/");
+			}
+			strcat(temporaryName, dent->d_name);
+						
+			int err=stat(temporaryName, &st);
+			if (err == 0) {
 				gmtime_s(&tm, &st.st_ctim.tv_sec);
 
-				gen_list_format(buffer, sizeof(buffer),
+				 tm = localtime(&(st.st_ctim));
+				 
+				 gen_list_format(buffer, sizeof(buffer),
 					st.st_mode,
 					st.st_size,
-					tm.tm_mon,
-					tm.tm_mday,
-					tm.tm_hour,
-					tm.tm_min,
+					tm->tm_mon,
+					tm->tm_mday,
+					tm->tm_hour,
+					tm->tm_min,
 					dent->d_name);
 
 				client_send_data_msg(client, buffer);
 				memset(buffer, 0, sizeof(buffer));
 			}
+			else
+			{
+				debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] error stat %d %s\n",err,dent->d_name);
+			}
+			
 			dent = (struct dirent *)((void *)dent + dent->d_reclen);
+				
+			memset(buffer, 0, sizeof(buffer));
+				
 		}
-		memset(dentbuf, 0, sizeof(dentbuf));
 	}
+	free(temporaryName);
+
+
+	
 
 	close(dfd);
 
-	DEBUG("Done sending LIST\n");
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Done sending LIST\n");
 
 	client_close_data_connection(client);
 	client_send_ctrl_msg(client, "226 Transfer complete.\n");
@@ -477,7 +503,7 @@ static void send_file(ClientInfo *client, const char *path)
 	int fd;
 	unsigned int bytes_read;
 
-	DEBUG("Opening: %s\n", path);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Opening: %s\n", path);
 
 	if ((fd = open(path, O_RDONLY, 0)) >= 0) {
 
@@ -532,7 +558,7 @@ static void receive_file(ClientInfo *client, const char *path)
 	int fd;
 	unsigned int bytes_recv;
 
-	DEBUG("Opening: %s\n", path);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Opening: %s\n", path);
 
 	if ((fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0777)) >= 0) {
 
@@ -568,7 +594,7 @@ static void cmd_STOR_func(ClientInfo *client)
 
 static void delete_file(ClientInfo *client, const char *path)
 {
-	DEBUG("Deleting: %s\n", path);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Deleting: %s\n", path);
 
 	if (unlink(path) >= 0) {
 		client_send_ctrl_msg(client, "226 File deleted.\n");
@@ -587,7 +613,7 @@ static void cmd_DELE_func(ClientInfo *client)
 static void delete_dir(ClientInfo *client, const char *path)
 {
 	int ret;
-	DEBUG("Deleting: %s\n", path);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Deleting: %s\n", path);
 	ret = rmdir(path);
 	if (ret >= 0) {
 		client_send_ctrl_msg(client, "226 Directory deleted.\n");
@@ -607,7 +633,7 @@ static void cmd_RMD_func(ClientInfo *client)
 
 static void create_dir(ClientInfo *client, const char *path)
 {
-	DEBUG("Creating: %s\n", path);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Creating: %s\n", path);
 
 	if (mkdir(path, 0777) >= 0) {
 		client_send_ctrl_msg(client, "226 Directory created.\n");
@@ -651,7 +677,7 @@ static void cmd_RNTO_func(ClientInfo *client)
 	/* Get the destination filename */
 	gen_filepath(client, path_to);
 
-	DEBUG("Renaming: %s to %s\n", client->rename_path, path_to);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Renaming: %s to %s\n", client->rename_path, path_to);
 
 	if (rename(client->rename_path, path_to) < 0) {
 		client_send_ctrl_msg(client, "550 Error renaming the file.\n");
@@ -768,20 +794,20 @@ static void *client_thread(void *arg)
 	cmd_dispatch_func dispatch_func;
 	ClientInfo *client = (ClientInfo *)arg;
 
-	DEBUG("Client thread %i started!\n", client->num);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Client thread %i started!\n", client->num);
 
 	client_send_ctrl_msg(client, "220 FTPS4 Server ready.\n");
 
-	while (1) {
+	while (ftp_active) {
 
 		memset(client->recv_buffer, 0, sizeof(client->recv_buffer));
 
 		client->n_recv = sceNetRecv(client->ctrl_sockfd, client->recv_buffer, sizeof(client->recv_buffer), 0);
 		if (client->n_recv > 0) {
-			DEBUG("Received %i bytes from client number %i:\n",
+			debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Received %i bytes from client number %i:\n",
 				client->n_recv, client->num);
 
-			INFO("\t%i> %s", client->num, client->recv_buffer);
+			debugNetPrintf(DEBUGNET_INFO,"\t%i> %s", client->num, client->recv_buffer);
 
 			/* The command are the first chars until the first space */
 			sscanf(client->recv_buffer, "%s", cmd);
@@ -797,7 +823,7 @@ static void *client_thread(void *arg)
 
 		} else if (client->n_recv == 0) {
 			/* Value 0 means connection closed by the remote peer */
-			INFO("Connection closed by the client %i.\n", client->num);
+			debugNetPrintf(DEBUGNET_INFO,"Connection closed by the client %i.\n", client->num);
 			/* Close the client's socket */
 			sceNetSocketClose(client->ctrl_sockfd);
 			/* Delete itself from the client list */
@@ -817,11 +843,11 @@ static void *client_thread(void *arg)
 		}
 	}
 
-	DEBUG("Client thread %i exiting!\n", client->num);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Client thread %i exiting!\n", client->num);
 
 	free(client);
 
-	scePthreadExit(NULL);
+	//scePthreadExit(NULL);
 	return NULL;
 }
 
@@ -832,7 +858,7 @@ static void *server_thread(void *arg)
 
 	struct sockaddr_in serveraddr;
 
-	DEBUG("Server thread started!\n");
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Server thread started!\n");
 
 	/* Create server socket */
 	server_sockfd = sceNetSocket("FTPS4_server_sock",
@@ -840,7 +866,7 @@ static void *server_thread(void *arg)
 		SOCK_STREAM,
 		0);
 
-	DEBUG("Server socket fd: %d\n", server_sockfd);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Server socket fd: %d\n", server_sockfd);
 
 	/* Fill the server's address */
 	serveraddr.sin_len = sizeof(serveraddr);
@@ -850,25 +876,25 @@ static void *server_thread(void *arg)
 
 	/* Bind the server's address to the socket */
 	ret = sceNetBind(server_sockfd, (struct sockaddr *)&serveraddr, sizeof(serveraddr));
-	DEBUG("sceNetBind(): 0x%08X\n", ret);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] sceNetBind(): 0x%08X\n", ret);
 
 	/* Start listening */
 	ret = sceNetListen(server_sockfd, 128);
-	DEBUG("sceNetListen(): 0x%08X\n", ret);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] sceNetListen(): 0x%08X\n", ret);
 
-	while (1) {
+	while (ftp_active) {
 
 		/* Accept clients */
 		struct sockaddr_in clientaddr;
 		int client_sockfd;
 		unsigned int addrlen = sizeof(clientaddr);
 
-		DEBUG("Waiting for incoming connections...\n");
+		debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Waiting for incoming connections on port: %d...\n", ps4_port);
 
 		client_sockfd = sceNetAccept(server_sockfd, (struct sockaddr *)&clientaddr, &addrlen);
 		if (client_sockfd >= 0) {
 
-			DEBUG("New connection, client fd: 0x%08X\n", client_sockfd);
+			debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] New connection, client fd: 0x%08X\n", client_sockfd);
 
 			/* Get the client's IP address */
 			char remote_ip[16];
@@ -877,7 +903,7 @@ static void *server_thread(void *arg)
 				remote_ip,
 				sizeof(remote_ip));
 
-			INFO("Client %i connected, IP: %s port: %i\n",
+			debugNetPrintf(DEBUGNET_INFO,"Client %i connected, IP: %s port: %i\n",
 				number_clients, remote_ip, clientaddr.sin_port);
 
 			/* Allocate the ClientInfo struct for the new client */
@@ -899,31 +925,32 @@ static void *server_thread(void *arg)
 			/* Create a new thread for the client */
 			scePthreadCreate(&client->thid, NULL, client_thread, client, client_thread_name);
 
-			DEBUG("Client %i thread UID: 0x%08X\n", number_clients, client->thid);
+			debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Client %i thread UID: 0x%08X\n", number_clients, client->thid);
 
 			number_clients++;
 		} else {
 			/* if sceNetAccept returns < 0, it means that the listening
 			 * socket has been closed, this means that we want to
 			 * finish the server thread */
-			DEBUG("Server socket closed, 0x%08X\n", client_sockfd);
+			debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Server socket closed, 0x%08X\n", client_sockfd);
 			break;
 		}
 	}
 
-	DEBUG("Server thread exiting!\n");
-
-	scePthreadExit(NULL);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Server thread exiting!\n");
+	
 	return NULL;
 }
 
 void ftp_init(const char *ip, unsigned short int port)
 {
+	OrbisNetCtlInfo orbis_info;
 	int ret;
+	char ps4_ip[16];
 	UNUSED(ret);
 
 	//SceNetInitParam initparam;
-	//SceNetCtlInfo info;
+	//SceNetCtlInfo DEBUGNET_INFO;
 
 	if (ftp_initialized) {
 		return;
@@ -932,44 +959,48 @@ void ftp_init(const char *ip, unsigned short int port)
 	/* Init Net */
 	/*if (sceNetShowNetstat() == PSP2_NET_ERROR_ENOTINIT) {
 		net_memory = malloc(NET_INIT_SIZE);
-
 		initparam.memory = net_memory;
 		initparam.size = NET_INIT_SIZE;
 		initparam.flags = 0;
-
 		ret = sceNetInit(&initparam);
-		DEBUG("sceNetInit(): 0x%08X\n", ret);
+		DEBUGNET_DEBUG("sceNetInit(): 0x%08X\n", ret);
 	} else {
-		DEBUG("Net is already initialized.\n");
+		DEBUGNET_DEBUG("Net is already initialized.\n");
 	}*/
 
 	/* Init NetCtl */
-	//ret = sceNetCtlInit();
-	//DEBUG("sceNetCtlInit(): 0x%08X\n", ret);
+	ret = sceNetCtlInit();
+	debugNetPrintf(DEBUGNET_DEBUG,"sceNetCtlInit(): 0x%08X\n", ret);
 
 	/* Get IP address */
-	//ret = sceNetCtlInetGetInfo(PSP2_NETCTL_INFO_GET_IP_ADDRESS, &info);
-	//DEBUG("sceNetCtlInetGetInfo(): 0x%08X\n", ret);
+	ret = sceNetCtlGetInfo(ORBIS_NET_CTL_INFO_IP_ADDRESS, &orbis_info);
+	debugNetPrintf(DEBUGNET_DEBUG,"sceNetCtlInetGetInfo(): 0x%08X\n", ret);
 
 	/* Return data */
-	//strcpy(vita_ip, info.ip_address);
+	strcpy(ps4_ip, orbis_info.ip_address);
 	//*vita_port = FTP_PORT;
 
 	/* Save the listening port of the PS4 to a global variable */
 	ps4_port = port;
 
+  	debugNetPrintf(DEBUGNET_DEBUG, "PS4 listening on IP %s Port %i\n", ps4_ip, port);
+
 	/* Save the IP of the PS4 to a global variable */
-	sceNetInetPton(AF_INET, ip, &ps4_addr);
+	sceNetInetPton(AF_INET, ps4_ip, &ps4_addr);
 
 	/* Create the client list mutex */
 	scePthreadMutexInit(&client_list_mtx, NULL, "FTPS4_client_list_mutex");
-	DEBUG("Client list mutex UID: 0x%08X\n", client_list_mtx);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Client list mutex UID: 0x%08X\n", client_list_mtx);
 
 	/* Create server thread */
 	scePthreadCreate(&server_thid, NULL, server_thread, NULL, "FTPS4_server_thread");
-	DEBUG("Server thread UID: 0x%08X\n", server_thid);
+	debugNetPrintf(DEBUGNET_DEBUG,"[PS4FTP] Server thread UID: 0x%08X\n", server_thid);
 
 	ftp_initialized = 1;
+	
+	scePthreadJoin(server_thid, NULL);
+	
+	
 }
 
 void ftp_fini()
@@ -979,7 +1010,7 @@ void ftp_fini()
 		 * we have to close the server socket; this way
 		 * the accept call will return an error */
 		sceNetSocketClose(server_sockfd);
-
+		//sceNetSocketAbort(server_sockfd,1);
 		/* To close the clients we have to do the same:
 		 * we have to iterate over all the clients
 		 * and close their sockets */
@@ -995,12 +1026,8 @@ void ftp_fini()
 		//sceNetCtlTerm();
 		//sceNetTerm();
 
-		if (net_memory) {
-			free(net_memory);
-			net_memory = NULL;
-		}
+		
 
 		ftp_initialized = 0;
 	}
 }
-
